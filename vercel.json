@@ -1,10 +1,9 @@
 {
   "version": 2,
   "builds": [
-    { "src": "Fair Value Stock Tracker.html", "use": "@vercel/static" }
+    { "src": "index.html", "use": "@vercel/static" }
   ],
   "routes": [
-    { "src": "/", "dest": "/Fair%20Value%20Stock%20Tracker.html" },
-    { "src": "/(.*)", "dest": "/Fair%20Value%20Stock%20Tracker.html" }
+    { "src": "/(.*)", "dest": "/index.html" }
   ]
 }
