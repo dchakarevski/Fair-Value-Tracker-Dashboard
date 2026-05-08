@@ -200,7 +200,8 @@ let groups = JSON.parse(localStorage.getItem('mwp_groups3') || 'null') || [
   { id: 2, name: 'Banks',    tickers: ['JPM','GS','MS','BAC','WFC','C','V'] },
 ];
 let stockData    = {};
-let profileCache = {};  // real market cap cache — persists across polls
+let profileCache = {};  // shareOutstanding + name — persists across polls
+let metricsCache = {};  // P/E and other fundamentals — fetched once per session
 let chartData    = {};
 let chartMode    = {};
 let prevPrices   = {};
@@ -208,7 +209,8 @@ let pollingTimer = null;
 let sortMode     = 'default';
 let editingGroupId = null;
 let lastRefresh  = 0;
-let profilesFetched = new Set(); // only fetch profile once per session
+let profilesFetched = new Set();
+let metricsFetched  = new Set();
 
 function saveGroups(){ localStorage.setItem('mwp_groups3', JSON.stringify(groups)); }
 function getAllTickers(){ return [...new Set(groups.flatMap(g => g.tickers))]; }
@@ -221,6 +223,11 @@ async function fetchQuote(ticker) {
     const d = await r.json();
     if(!d || !d.c || d.c === 0){ if(!stockData[ticker]) stockData[ticker] = mockQuote(ticker); return; }
     prevPrices[ticker] = stockData[ticker]?.price;
+    // Real-time market cap: shares outstanding × live price (updates every poll)
+    const shares = profileCache[ticker]?.shareOutstanding;
+    const marketCap = shares
+      ? shares * 1e6 * d.c
+      : (profileCache[ticker]?.staticMarketCap || estMktCap(ticker, d.c));
     stockData[ticker] = {
       ticker,
       price:      d.c,
@@ -232,8 +239,7 @@ async function fetchQuote(ticker) {
       changePct:  d.dp,
       preMarket:  d.c * (1 + (Math.random()-0.5)*0.004),
       afterHours: d.c * (1 + (Math.random()-0.5)*0.006),
-      // Use cached real market cap if available, else estimate
-      marketCap:  profileCache[ticker]?.marketCap || estMktCap(ticker, d.c),
+      marketCap,
       volume:     estVol(ticker),
     };
   } catch { if(!stockData[ticker]) stockData[ticker] = mockQuote(ticker); }
@@ -245,17 +251,35 @@ async function fetchProfile(ticker) {
   try {
     const r = await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${ticker}&token=${FINNHUB_KEY}`);
     const d = await r.json();
-    if(d && d.marketCapitalization && d.marketCapitalization > 0) {
-      const realMktCap = d.marketCapitalization * 1e6; // convert millions → raw dollars
-      profileCache[ticker] = { marketCap: realMktCap, name: d.name || NAMES[ticker] };
-      // Patch into stockData immediately if it exists
+    if(d && d.shareOutstanding && d.shareOutstanding > 0) {
+      profileCache[ticker] = {
+        shareOutstanding: d.shareOutstanding,           // millions of shares
+        staticMarketCap:  (d.marketCapitalization||0) * 1e6, // fallback if price not yet loaded
+        name: d.name || NAMES[ticker],
+      };
+      if(d.name) NAMES[ticker] = d.name;
+      // Patch live market cap immediately if price is already in stockData
       if(stockData[ticker]) {
-        stockData[ticker].marketCap = realMktCap;
-        if(d.name) NAMES[ticker] = d.name; // update display name too
+        stockData[ticker].marketCap = d.shareOutstanding * 1e6 * stockData[ticker].price;
       }
     }
     profilesFetched.add(ticker);
   } catch { profilesFetched.add(ticker); } // mark as attempted even on failure
+}
+
+// ── METRICS FETCH (P/E ratio — once per session) ─────────────
+async function fetchMetrics(ticker) {
+  try {
+    const r = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${FINNHUB_KEY}`);
+    const d = await r.json();
+    if(d && d.metric) {
+      const m = d.metric;
+      metricsCache[ticker] = {
+        pe: m.peBasicExclExtraTTM ?? m.peTTM ?? m.peNormalizedAnnual ?? null,
+      };
+    }
+  } catch {}
+  metricsFetched.add(ticker);
 }
 
 // ── CANDLE FETCH (for charts) ─────────────────────────────────
@@ -329,6 +353,7 @@ const fmtMcap=n=>{
   return '$'+(n/1e6).toFixed(0)+'M';
 };
 const fmtVol=n=>!n?'--':n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':(n/1e3).toFixed(0)+'K';
+const fmtPE=n=>n==null||isNaN(n)||n<=0?'--':n.toFixed(1)+'x';
 
 // ── CHART DRAWING ─────────────────────────────────────────────
 function drawChart(canvas, points, isUp, mode) {
@@ -424,9 +449,8 @@ function renderCard(ticker, gid){
   const up=(d?.changePct||0)>=0;
   const key=`${gid}-${ticker}`, mode=chartMode[key]||'1D';
   const name=NAMES[ticker]||ticker;
-  const mcapLabel = profilesFetched.has(ticker) && profileCache[ticker]?.marketCap
-    ? fmtMcap(profileCache[ticker].marketCap)
-    : (d ? fmtMcap(d.marketCap) : '--');
+  const mcapLabel = d ? fmtMcap(d.marketCap) : '--';
+  const peLabel   = fmtPE(metricsCache[ticker]?.pe);
 
   return `<div class="stock-card ${up?'up':'down'}${flash}" id="card-${gid}-${ticker}">
     ${d&&Math.abs(d.changePct||0)>3?'<div class="alert-dot" title="High volatility"></div>':''}
@@ -453,6 +477,7 @@ function renderCard(ticker, gid){
       <div class="metric"><div class="metric-label">Day Open</div><div class="metric-value">$${d?fmt(d.open):'--'}</div></div>
       <div class="metric"><div class="metric-label">Pre-Mkt</div><div class="metric-value pre">$${d?fmt(d.preMarket):'--'}</div></div>
       <div class="metric"><div class="metric-label">After-Hrs</div><div class="metric-value after">$${d?fmt(d.afterHours):'--'}</div></div>
+      <div class="metric"><div class="metric-label">P/E Ratio</div><div class="metric-value">${peLabel}</div></div>
     </div>
   </div>`;
 }
@@ -530,6 +555,7 @@ function saveGroup(){
   const newT=tickers.filter(t=>!stockData[t]);
   Promise.all(newT.map(t=>fetchQuote(t)))
     .then(()=>Promise.all(newT.filter(t=>!profilesFetched.has(t)).map(t=>fetchProfile(t))))
+    .then(()=>Promise.all(newT.filter(t=>!metricsFetched.has(t)).map(t=>fetchMetrics(t))))
     .then(()=>Promise.all(tickers.map(t=>fetchChartData(t))))
     .then(renderGroups);
 }
@@ -548,17 +574,27 @@ async function refreshAll(force=false){
     }
     renderGroups(); updateTickerBar();
 
-    // 2. Fetch profiles for real market cap (only once per session per ticker)
+    // 2. Fetch profiles (shareOutstanding for real-time market cap) — once per session
     const needsProfile=tickers.filter(t=>!profilesFetched.has(t));
     if(needsProfile.length>0){
       for(let i=0;i<needsProfile.length;i+=4){
         await Promise.all(needsProfile.slice(i,i+4).map(t=>fetchProfile(t)));
         if(i+4<needsProfile.length) await sleep(300);
       }
-      renderGroups(); // re-render with real market caps
     }
 
-    // 3. Fetch chart candles (slower — 3 calls per ticker)
+    // 3. Fetch fundamentals (P/E ratio) — once per session
+    const needsMetrics=tickers.filter(t=>!metricsFetched.has(t));
+    if(needsMetrics.length>0){
+      for(let i=0;i<needsMetrics.length;i+=4){
+        await Promise.all(needsMetrics.slice(i,i+4).map(t=>fetchMetrics(t)));
+        if(i+4<needsMetrics.length) await sleep(300);
+      }
+    }
+
+    if(needsProfile.length>0||needsMetrics.length>0) renderGroups();
+
+    // 4. Fetch chart candles (slower — 3 calls per ticker)
     for(let i=0;i<tickers.length;i+=2){
       await Promise.all(tickers.slice(i,i+2).map(t=>fetchChartData(t)));
       if(i+2<tickers.length) await sleep(400);
